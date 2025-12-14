@@ -22,10 +22,10 @@ struct ViewState {
 impl ViewState {
     fn new() -> Self {
         ViewState {
-            re_min: -0.5,
-            re_max: 1.5,
-            im_min: -20.0,
-            im_max: 20.0,
+            re_min: -19.5,
+            re_max: 20.5,
+            im_min: -15.0,
+            im_max: 15.0,
             precision: 64,
             compute_width: 160,
             compute_height: 120,
@@ -44,6 +44,23 @@ impl ViewState {
         self.re_max = center_re + new_re_range * (self.re_max - center_re) / re_range;
         self.im_min = center_im - new_im_range * (center_im - self.im_min) / im_range;
         self.im_max = center_im + new_im_range * (self.im_max - center_im) / im_range;
+
+        self.correct_aspect_ratio(800, 600);
+    }
+
+    fn correct_aspect_ratio(&mut self, window_width: u32, window_height: u32) {
+        let current_re_range = self.re_max - self.re_min;
+        let current_im_range = self.im_max - self.im_min;
+        let current_ratio = current_re_range / current_im_range;
+        let target_ratio = window_width as f64 / window_height as f64;
+
+        if (current_ratio - target_ratio).abs() > 0.001 {
+            let center_re = (self.re_min + self.re_max) / 2.0;
+
+            let new_re_range = current_im_range * target_ratio;
+            self.re_min = center_re - new_re_range / 2.0;
+            self.re_max = center_re + new_re_range / 2.0;
+        }
     }
 
     fn pan(&mut self, delta_re: f64, delta_im: f64) {
@@ -51,6 +68,8 @@ impl ViewState {
         self.re_max += delta_re;
         self.im_min += delta_im;
         self.im_max += delta_im;
+
+        self.correct_aspect_ratio(800, 600);
     }
 
     fn pixel_to_complex(&self, x: i32, y: i32, window_width: u32, window_height: u32) -> (f64, f64) {
