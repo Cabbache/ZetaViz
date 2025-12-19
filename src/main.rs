@@ -18,6 +18,7 @@ struct ViewState {
     compute_height: u32,
     show_axes: bool,
     log_scale: bool,
+    filter_re_ge_1: bool,
 }
 
 impl ViewState {
@@ -32,6 +33,7 @@ impl ViewState {
             compute_height: 120,
             show_axes: true,
             log_scale: true,
+            filter_re_ge_1: false,
         }
     }
 
@@ -199,10 +201,6 @@ impl RenderState {
         self.render_re_max = view.re_max;
         self.render_im_min = view.im_min;
         self.render_im_max = view.im_max;
-        println!(
-            "[FREEZE] Render coords: Re ∈ [{:.6}, {:.6}], Im ∈ [{:.6}, {:.6}]",
-            self.render_re_min, self.render_re_max, self.render_im_min, self.render_im_max
-        );
     }
 
     fn can_incremental_update(&self, view: &ViewState, width: u32, height: u32) -> bool {
@@ -253,11 +251,6 @@ impl RenderState {
         let dy_error = (dy_exact - dy_pixels as f64).abs();
         let max_error = dx_error.max(dy_error);
 
-        println!(
-            "[SHIFT] Pixel shift: dx={}, dy={} (error: {:.3})",
-            dx_pixels, dy_pixels, max_error
-        );
-
         // Snap view coordinates to pixel boundaries to eliminate sub-pixel errors
         if max_error > 0.01 {
             let re_per_pixel = new_re_range / width as f64;
@@ -271,29 +264,17 @@ impl RenderState {
             new_view.re_max += re_correction;
             new_view.im_min -= im_correction; // Note: im is inverted in screen coords
             new_view.im_max -= im_correction;
-
-            println!(
-                "[SHIFT] Snapped view to pixel boundaries (re_corr: {:.6}, im_corr: {:.6})",
-                re_correction, im_correction
-            );
         }
 
         // If shift is too large, just recompute everything
         if dx_pixels.abs() >= width as i32 || dy_pixels.abs() >= height as i32 {
-            println!(
-                "[SHIFT] Shift too large ({}, {}), falling back to full recompute",
-                dx_pixels, dy_pixels
-            );
             return vec![(0, 0, width, height)];
         }
 
         // If no shift at all, nothing to do
         if dx_pixels == 0 && dy_pixels == 0 {
-            println!("[SHIFT] No shift detected, buffer still valid");
             return vec![];
         }
-
-        println!("[SHIFT] Copying shifted buffer...");
 
         // Create new buffer
         let mut new_buffer = vec![Color::RGB(0, 0, 0); (width * height) as usize];
@@ -319,15 +300,11 @@ impl RenderState {
 
         if dx_pixels > 0 {
             // Need to fill left strip
-            let area = dx_pixels as u32 * height;
             regions.push((0, 0, dx_pixels as u32, height));
-            println!("[SHIFT] Added left strip: {} pixels", area);
         } else if dx_pixels < 0 {
             // Need to fill right strip
             let x_start = (width as i32 + dx_pixels) as u32;
-            let area = (-dx_pixels) as u32 * height;
             regions.push((x_start, 0, width, height));
-            println!("[SHIFT] Added right strip: {} pixels", area);
         }
 
         if dy_pixels > 0 {
@@ -338,9 +315,7 @@ impl RenderState {
             } else {
                 width
             };
-            let area = (x_end - x_start) * dy_pixels as u32;
             regions.push((x_start, 0, x_end, dy_pixels as u32));
-            println!("[SHIFT] Added top strip: {} pixels", area);
         } else if dy_pixels < 0 {
             // Need to fill bottom strip (excluding already computed horizontal strip)
             let x_start = if dx_pixels > 0 { dx_pixels as u32 } else { 0 };
@@ -350,23 +325,9 @@ impl RenderState {
                 width
             };
             let y_start = (height as i32 + dy_pixels) as u32;
-            let area = (x_end - x_start) * (-dy_pixels) as u32;
             regions.push((x_start, y_start, x_end, height));
-            println!("[SHIFT] Added bottom strip: {} pixels", area);
         }
 
-        let total_pixels: u32 = regions
-            .iter()
-            .map(|(x1, y1, x2, y2)| (x2 - x1) * (y2 - y1))
-            .sum();
-        let total_buffer = width * height;
-        let percentage = (total_pixels as f32 / total_buffer as f32 * 100.0) as u32;
-        println!(
-            "[SHIFT] Total: {} regions, {} pixels ({}% of buffer)",
-            regions.len(),
-            total_pixels,
-            percentage
-        );
         regions
     }
 }
@@ -381,15 +342,17 @@ fn main() {
     println!("  [/] : Decrease/increase computation resolution");
     println!("  A : Toggle axes");
     println!("  L : Toggle logarithmic color scale");
+    println!("  F : Toggle filter (hide Re >= 1)");
     println!("  R : Reset view");
+    println!("  Space : Force re-render");
     println!("  ESC : Exit\n");
 
     let sdl_context = sdl2::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
     let ttf_context = sdl2::ttf::init().unwrap();
 
-    let window_width = 800u32;
-    let window_height = 600u32;
+    let window_width = 1920u32;
+    let window_height = 1080u32;
 
     let window = video_subsystem
         .window("Riemann Zeta Visualization", window_width, window_height)
@@ -464,16 +427,8 @@ fn main() {
                         view.pan(delta_re, delta_im);
 
                         if render_state.is_complete {
-                            println!(
-                                "[PAN EVENT] Mouse delta: ({}, {}), triggering incremental update",
-                                dx, dy
-                            );
                             needs_recompute = true;
                         } else {
-                            println!(
-                                "[PAN EVENT] Mouse delta: ({}, {}), render in progress - will update after completion",
-                                dx, dy
-                            );
                             pending_recompute = true;
                         }
 
@@ -551,6 +506,20 @@ fn main() {
                         needs_recompute = true;
                         println!("View reset");
                     }
+                    Keycode::Space => {
+                        render_state =
+                            RenderState::new(&view, view.compute_width, view.compute_height);
+                        needs_recompute = true;
+                        println!("Force re-render");
+                    }
+                    Keycode::F => {
+                        view.filter_re_ge_1 = !view.filter_re_ge_1;
+                        println!(
+                            "Hide Re >= 1: {}",
+                            if view.filter_re_ge_1 { "ON" } else { "OFF" }
+                        );
+                        needs_recompute = true;
+                    }
                     _ => {}
                 },
 
@@ -559,43 +528,14 @@ fn main() {
         }
 
         if needs_recompute {
-            // We only set needs_recompute when rendering is complete (or for non-pan events)
-            // So we can safely check for incremental updates
             let can_incremental =
                 render_state.can_incremental_update(&view, view.compute_width, view.compute_height);
 
-            println!(
-                "[RECOMPUTE CHECK] can_incremental: {}, is_complete: {}",
-                can_incremental, render_state.is_complete
-            );
-
             if can_incremental {
-                println!("[INCREMENTAL] Starting incremental update");
                 let width = view.compute_width;
                 let height = view.compute_height;
                 render_state.start_incremental_recompute(&mut view, width, height);
-                println!(
-                    "[INCREMENTAL] -> {} new regions to compute",
-                    render_state.regions_to_compute.len()
-                );
             } else {
-                let reason = if render_state.prev_precision == 0 {
-                    "first render"
-                } else if render_state.prev_precision != view.precision {
-                    "precision changed"
-                } else if render_state.prev_log_scale != view.log_scale {
-                    "scale changed"
-                } else if render_state.buffer.len()
-                    != (view.compute_width * view.compute_height) as usize
-                {
-                    "resolution changed"
-                } else {
-                    "view range changed (zoom/reset)"
-                };
-                println!(
-                    "[FULL RECOMPUTE] Reason: {}, Re ∈ [{:.3}, {:.3}], Im ∈ [{:.3}, {:.3}]",
-                    reason, view.re_min, view.re_max, view.im_min, view.im_max
-                );
                 render_state.start_full_recompute(&view, view.compute_width, view.compute_height);
             }
             needs_recompute = false;
@@ -612,6 +552,7 @@ fn main() {
             let compute_width = view.compute_width;
             let compute_height = view.compute_height;
             let log_scale = view.log_scale;
+            let filter_re_ge_1 = view.filter_re_ge_1;
 
             // Process current region
             if render_state.current_region_idx < render_state.regions_to_compute.len() {
@@ -631,13 +572,18 @@ fn main() {
                             let im =
                                 im_max - (y as f64 / compute_height as f64) * (im_max - im_min);
 
-                            let s = Complex::with_val(precision, (re, im));
-                            let zeta = riemann_zeta(&s);
+                            let color = if filter_re_ge_1 && re >= 1.0 {
+                                // Skip computation for Re >= 1 when filter is enabled
+                                Color::RGB(0, 0, 0)
+                            } else {
+                                let s = Complex::with_val(precision, (re, im));
+                                let zeta = riemann_zeta(&s);
 
-                            let magnitude = (zeta.real().to_f64().powi(2)
-                                + zeta.imag().to_f64().powi(2))
-                            .sqrt();
-                            let color = magnitude_to_color(magnitude, log_scale);
+                                let magnitude = (zeta.real().to_f64().powi(2)
+                                    + zeta.imag().to_f64().powi(2))
+                                .sqrt();
+                                magnitude_to_color(magnitude, log_scale)
+                            };
 
                             row_pixels.push((x, y, color));
                         }
@@ -667,13 +613,9 @@ fn main() {
                 // Check if all regions are complete
                 if render_state.current_region_idx >= render_state.regions_to_compute.len() {
                     render_state.is_complete = true;
-                    println!("[RENDER COMPLETE] All regions finished, buffer is now stable");
 
                     // If we accumulated pans during rendering, process them now
                     if pending_recompute {
-                        println!(
-                            "[RENDER COMPLETE] Pending pan detected, triggering incremental update"
-                        );
                         needs_recompute = true;
                         pending_recompute = false;
                     }
@@ -878,7 +820,7 @@ fn draw_info_overlay(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     view: &ViewState,
     render_state: &RenderState,
-    _width: u32,
+    width: u32,
     _height: u32,
 ) {
     let progress = if render_state.is_complete {
@@ -890,7 +832,7 @@ fn draw_info_overlay(
     if !render_state.is_complete {
         canvas.set_draw_color(Color::RGBA(255, 255, 0, 200));
         let bar_height = 4;
-        let bar_width = (800.0 * progress as f32 / 100.0) as u32;
+        let bar_width = (width as f32 * progress as f32 / 100.0) as u32;
         canvas
             .fill_rect(Rect::new(0, 0, bar_width, bar_height))
             .unwrap();
