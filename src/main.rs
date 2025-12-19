@@ -35,7 +35,14 @@ impl ViewState {
         }
     }
 
-    fn zoom(&mut self, factor: f64, center_re: f64, center_im: f64, window_width: u32, window_height: u32) {
+    fn zoom(
+        &mut self,
+        factor: f64,
+        center_re: f64,
+        center_im: f64,
+        window_width: u32,
+        window_height: u32,
+    ) {
         let re_range = self.re_max - self.re_min;
         let im_range = self.im_max - self.im_min;
 
@@ -73,7 +80,13 @@ impl ViewState {
         // Don't correct aspect ratio during pan - it breaks incremental rendering
     }
 
-    fn pixel_to_complex(&self, x: i32, y: i32, window_width: u32, window_height: u32) -> (f64, f64) {
+    fn pixel_to_complex(
+        &self,
+        x: i32,
+        y: i32,
+        window_width: u32,
+        window_height: u32,
+    ) -> (f64, f64) {
         let re = self.re_min + (x as f64 / window_width as f64) * (self.re_max - self.re_min);
         let im = self.im_max - (y as f64 / window_height as f64) * (self.im_max - self.im_min);
         (re, im)
@@ -93,6 +106,11 @@ struct RenderState {
     regions_to_compute: Vec<(u32, u32, u32, u32)>, // (x_start, y_start, x_end, y_end)
     current_region_idx: usize,
     current_region_row: u32,
+    // Frozen view bounds for rendering (to avoid coordinate drift during panning)
+    render_re_min: f64,
+    render_re_max: f64,
+    render_im_min: f64,
+    render_im_max: f64,
 }
 
 impl RenderState {
@@ -105,11 +123,15 @@ impl RenderState {
             prev_re_max: 0.0,
             prev_im_min: 0.0,
             prev_im_max: 0.0,
-            prev_precision: 0,  // Set to 0 to force full recompute on first render
+            prev_precision: 0, // Set to 0 to force full recompute on first render
             prev_log_scale: view.log_scale,
             regions_to_compute: vec![(0, 0, width, height)],
             current_region_idx: 0,
             current_region_row: 0,
+            render_re_min: view.re_min,
+            render_re_max: view.re_max,
+            render_im_min: view.im_min,
+            render_im_max: view.im_max,
         }
     }
 
@@ -138,9 +160,15 @@ impl RenderState {
         self.prev_im_max = view.im_max;
         self.prev_precision = view.precision;
         self.prev_log_scale = view.log_scale;
+
+        // Freeze render coordinates
+        self.render_re_min = view.re_min;
+        self.render_re_max = view.re_max;
+        self.render_im_min = view.im_min;
+        self.render_im_max = view.im_max;
     }
 
-    fn start_incremental_recompute(&mut self, view: &ViewState, width: u32, height: u32) {
+    fn start_incremental_recompute(&mut self, view: &mut ViewState, width: u32, height: u32) {
         let old_view = (
             self.prev_re_min,
             self.prev_re_max,
@@ -151,7 +179,7 @@ impl RenderState {
         self.regions_to_compute = self.shift_and_fill(old_view, view, width, height);
         self.current_region_idx = 0;
         self.current_region_row = if !self.regions_to_compute.is_empty() {
-            self.regions_to_compute[0].1  // y_start of first region
+            self.regions_to_compute[0].1 // y_start of first region
         } else {
             0
         };
@@ -164,6 +192,17 @@ impl RenderState {
         self.prev_re_max = view.re_max;
         self.prev_im_min = view.im_min;
         self.prev_im_max = view.im_max;
+
+        // CRITICAL: Freeze render coordinates after snapping
+        // These will be used for computing pixels and must not change during rendering
+        self.render_re_min = view.re_min;
+        self.render_re_max = view.re_max;
+        self.render_im_min = view.im_min;
+        self.render_im_max = view.im_max;
+        println!(
+            "[FREEZE] Render coords: Re ∈ [{:.6}, {:.6}], Im ∈ [{:.6}, {:.6}]",
+            self.render_re_min, self.render_re_max, self.render_im_min, self.render_im_max
+        );
     }
 
     fn can_incremental_update(&self, view: &ViewState, width: u32, height: u32) -> bool {
@@ -191,7 +230,7 @@ impl RenderState {
     fn shift_and_fill(
         &mut self,
         old_view: (f64, f64, f64, f64),
-        new_view: &ViewState,
+        new_view: &mut ViewState,
         width: u32,
         height: u32,
     ) -> Vec<(u32, u32, u32, u32)> {
@@ -201,23 +240,60 @@ impl RenderState {
         let new_re_range = new_view.re_max - new_view.re_min;
         let new_im_range = new_view.im_max - new_view.im_min;
 
-        // Calculate pixel shift
-        let dx_pixels = ((old_re_min - new_view.re_min) / new_re_range * width as f64).round() as i32;
-        let dy_pixels = ((new_view.im_max - old_im_max) / new_im_range * height as f64).round() as i32;
+        // Calculate pixel shift (exact floating point)
+        let dx_exact = (old_re_min - new_view.re_min) / new_re_range * width as f64;
+        let dy_exact = (new_view.im_max - old_im_max) / new_im_range * height as f64;
 
-        println!("  Pixel shift: dx={}, dy={}", dx_pixels, dy_pixels);
+        // Round to nearest integer
+        let dx_pixels = dx_exact.round() as i32;
+        let dy_pixels = dy_exact.round() as i32;
+
+        // Check for sub-pixel rounding errors
+        let dx_error = (dx_exact - dx_pixels as f64).abs();
+        let dy_error = (dy_exact - dy_pixels as f64).abs();
+        let max_error = dx_error.max(dy_error);
+
+        println!(
+            "[SHIFT] Pixel shift: dx={}, dy={} (error: {:.3})",
+            dx_pixels, dy_pixels, max_error
+        );
+
+        // Snap view coordinates to pixel boundaries to eliminate sub-pixel errors
+        if max_error > 0.01 {
+            let re_per_pixel = new_re_range / width as f64;
+            let im_per_pixel = new_im_range / height as f64;
+
+            // Adjust view to match the rounded pixel shift
+            let re_correction = (dx_exact - dx_pixels as f64) * re_per_pixel;
+            let im_correction = (dy_exact - dy_pixels as f64) * im_per_pixel;
+
+            new_view.re_min += re_correction;
+            new_view.re_max += re_correction;
+            new_view.im_min -= im_correction; // Note: im is inverted in screen coords
+            new_view.im_max -= im_correction;
+
+            println!(
+                "[SHIFT] Snapped view to pixel boundaries (re_corr: {:.6}, im_corr: {:.6})",
+                re_correction, im_correction
+            );
+        }
 
         // If shift is too large, just recompute everything
         if dx_pixels.abs() >= width as i32 || dy_pixels.abs() >= height as i32 {
-            println!("  Shift too large, full recompute");
+            println!(
+                "[SHIFT] Shift too large ({}, {}), falling back to full recompute",
+                dx_pixels, dy_pixels
+            );
             return vec![(0, 0, width, height)];
         }
 
         // If no shift at all, nothing to do
         if dx_pixels == 0 && dy_pixels == 0 {
-            println!("  No shift, nothing to recompute");
+            println!("[SHIFT] No shift detected, buffer still valid");
             return vec![];
         }
+
+        println!("[SHIFT] Copying shifted buffer...");
 
         // Create new buffer
         let mut new_buffer = vec![Color::RGB(0, 0, 0); (width * height) as usize];
@@ -243,31 +319,54 @@ impl RenderState {
 
         if dx_pixels > 0 {
             // Need to fill left strip
+            let area = dx_pixels as u32 * height;
             regions.push((0, 0, dx_pixels as u32, height));
-            println!("  Added left strip: (0, 0, {}, {})", dx_pixels, height);
+            println!("[SHIFT] Added left strip: {} pixels", area);
         } else if dx_pixels < 0 {
             // Need to fill right strip
             let x_start = (width as i32 + dx_pixels) as u32;
+            let area = (-dx_pixels) as u32 * height;
             regions.push((x_start, 0, width, height));
-            println!("  Added right strip: ({}, 0, {}, {})", x_start, width, height);
+            println!("[SHIFT] Added right strip: {} pixels", area);
         }
 
         if dy_pixels > 0 {
             // Need to fill top strip (excluding already computed horizontal strip)
             let x_start = if dx_pixels > 0 { dx_pixels as u32 } else { 0 };
-            let x_end = if dx_pixels < 0 { (width as i32 + dx_pixels) as u32 } else { width };
+            let x_end = if dx_pixels < 0 {
+                (width as i32 + dx_pixels) as u32
+            } else {
+                width
+            };
+            let area = (x_end - x_start) * dy_pixels as u32;
             regions.push((x_start, 0, x_end, dy_pixels as u32));
-            println!("  Added top strip: ({}, 0, {}, {})", x_start, x_end, dy_pixels);
+            println!("[SHIFT] Added top strip: {} pixels", area);
         } else if dy_pixels < 0 {
             // Need to fill bottom strip (excluding already computed horizontal strip)
             let x_start = if dx_pixels > 0 { dx_pixels as u32 } else { 0 };
-            let x_end = if dx_pixels < 0 { (width as i32 + dx_pixels) as u32 } else { width };
+            let x_end = if dx_pixels < 0 {
+                (width as i32 + dx_pixels) as u32
+            } else {
+                width
+            };
             let y_start = (height as i32 + dy_pixels) as u32;
+            let area = (x_end - x_start) * (-dy_pixels) as u32;
             regions.push((x_start, y_start, x_end, height));
-            println!("  Added bottom strip: ({}, {}, {}, {})", x_start, y_start, x_end, height);
+            println!("[SHIFT] Added bottom strip: {} pixels", area);
         }
 
-        println!("  Total regions to compute: {}", regions.len());
+        let total_pixels: u32 = regions
+            .iter()
+            .map(|(x1, y1, x2, y2)| (x2 - x1) * (y2 - y1))
+            .sum();
+        let total_buffer = width * height;
+        let percentage = (total_pixels as f32 / total_buffer as f32 * 100.0) as u32;
+        println!(
+            "[SHIFT] Total: {} regions, {} pixels ({}% of buffer)",
+            regions.len(),
+            total_pixels,
+            percentage
+        );
         regions
     }
 }
@@ -316,6 +415,7 @@ fn main() {
     let mut view = ViewState::new();
     let mut render_state = RenderState::new(&view, view.compute_width, view.compute_height);
     let mut needs_recompute = true;
+    let mut pending_recompute = false; // Set when we get pan during rendering
 
     let mut is_dragging = false;
     let mut last_mouse_pos = (0i32, 0i32);
@@ -362,7 +462,20 @@ fn main() {
                         let delta_im = (dy as f64 / window_height as f64) * im_range;
 
                         view.pan(delta_re, delta_im);
-                        needs_recompute = true;
+
+                        if render_state.is_complete {
+                            println!(
+                                "[PAN EVENT] Mouse delta: ({}, {}), triggering incremental update",
+                                dx, dy
+                            );
+                            needs_recompute = true;
+                        } else {
+                            println!(
+                                "[PAN EVENT] Mouse delta: ({}, {}), render in progress - will update after completion",
+                                dx, dy
+                            );
+                            pending_recompute = true;
+                        }
 
                         last_mouse_pos = (x, y);
                     }
@@ -377,7 +490,13 @@ fn main() {
                     );
 
                     let zoom_factor = if wheel_y > 0 { 0.8 } else { 1.25 };
-                    view.zoom(zoom_factor, center_re, center_im, window_width, window_height);
+                    view.zoom(
+                        zoom_factor,
+                        center_re,
+                        center_im,
+                        window_width,
+                        window_height,
+                    );
                     needs_recompute = true;
                 }
 
@@ -399,14 +518,18 @@ fn main() {
                         view.compute_width = (view.compute_width * 2 / 3).max(1);
                         view.compute_height = (view.compute_height * 2 / 3).max(1);
                         println!("Resolution: {}x{}", view.compute_width, view.compute_height);
-                        render_state = RenderState::new(&view, view.compute_width, view.compute_height);
+                        render_state =
+                            RenderState::new(&view, view.compute_width, view.compute_height);
                         needs_recompute = true;
                     }
                     Keycode::RightBracket => {
-                        view.compute_width = (view.compute_width * 3 / 2).max(view.compute_width + 1);
-                        view.compute_height = (view.compute_height * 3 / 2).max(view.compute_height + 1);
+                        view.compute_width =
+                            (view.compute_width * 3 / 2).max(view.compute_width + 1);
+                        view.compute_height =
+                            (view.compute_height * 3 / 2).max(view.compute_height + 1);
                         println!("Resolution: {}x{}", view.compute_width, view.compute_height);
-                        render_state = RenderState::new(&view, view.compute_width, view.compute_height);
+                        render_state =
+                            RenderState::new(&view, view.compute_width, view.compute_height);
                         needs_recompute = true;
                     }
                     Keycode::A => {
@@ -415,12 +538,16 @@ fn main() {
                     }
                     Keycode::L => {
                         view.log_scale = !view.log_scale;
-                        println!("Logarithmic scale: {}", if view.log_scale { "ON" } else { "OFF" });
+                        println!(
+                            "Logarithmic scale: {}",
+                            if view.log_scale { "ON" } else { "OFF" }
+                        );
                         needs_recompute = true;
                     }
                     Keycode::R => {
                         view = ViewState::new();
-                        render_state = RenderState::new(&view, view.compute_width, view.compute_height);
+                        render_state =
+                            RenderState::new(&view, view.compute_width, view.compute_height);
                         needs_recompute = true;
                         println!("View reset");
                     }
@@ -432,12 +559,25 @@ fn main() {
         }
 
         if needs_recompute {
-            let can_incremental = render_state.can_incremental_update(&view, view.compute_width, view.compute_height);
+            // We only set needs_recompute when rendering is complete (or for non-pan events)
+            // So we can safely check for incremental updates
+            let can_incremental =
+                render_state.can_incremental_update(&view, view.compute_width, view.compute_height);
+
+            println!(
+                "[RECOMPUTE CHECK] can_incremental: {}, is_complete: {}",
+                can_incremental, render_state.is_complete
+            );
+
             if can_incremental {
-                let regions = render_state.regions_to_compute.len();
-                println!("Incremental update: {} regions to compute", regions);
-                render_state.start_incremental_recompute(&view, view.compute_width, view.compute_height);
-                println!("  -> {} new regions", render_state.regions_to_compute.len());
+                println!("[INCREMENTAL] Starting incremental update");
+                let width = view.compute_width;
+                let height = view.compute_height;
+                render_state.start_incremental_recompute(&mut view, width, height);
+                println!(
+                    "[INCREMENTAL] -> {} new regions to compute",
+                    render_state.regions_to_compute.len()
+                );
             } else {
                 let reason = if render_state.prev_precision == 0 {
                     "first render"
@@ -445,15 +585,16 @@ fn main() {
                     "precision changed"
                 } else if render_state.prev_log_scale != view.log_scale {
                     "scale changed"
-                } else if render_state.buffer.len() != (view.compute_width * view.compute_height) as usize {
+                } else if render_state.buffer.len()
+                    != (view.compute_width * view.compute_height) as usize
+                {
                     "resolution changed"
                 } else {
                     "view range changed (zoom/reset)"
                 };
                 println!(
-                    "Full recompute ({}): Re ∈ [{:.3}, {:.3}], Im ∈ [{:.3}, {:.3}], Prec: {}, Res: {}x{}",
-                    reason, view.re_min, view.re_max, view.im_min, view.im_max, view.precision,
-                    view.compute_width, view.compute_height
+                    "[FULL RECOMPUTE] Reason: {}, Re ∈ [{:.3}, {:.3}], Im ∈ [{:.3}, {:.3}]",
+                    reason, view.re_min, view.re_max, view.im_min, view.im_max
                 );
                 render_state.start_full_recompute(&view, view.compute_width, view.compute_height);
             }
@@ -461,10 +602,12 @@ fn main() {
         }
 
         if !render_state.is_complete {
-            let re_min = view.re_min;
-            let re_max = view.re_max;
-            let im_min = view.im_min;
-            let im_max = view.im_max;
+            // CRITICAL: Use frozen render coordinates, not current view coordinates
+            // This prevents artifacts when panning during incremental rendering
+            let re_min = render_state.render_re_min;
+            let re_max = render_state.render_re_max;
+            let im_min = render_state.render_im_min;
+            let im_max = render_state.render_im_max;
             let precision = view.precision;
             let compute_width = view.compute_width;
             let compute_height = view.compute_height;
@@ -472,7 +615,8 @@ fn main() {
 
             // Process current region
             if render_state.current_region_idx < render_state.regions_to_compute.len() {
-                let (x_start, _y_start, x_end, y_end) = render_state.regions_to_compute[render_state.current_region_idx];
+                let (x_start, _y_start, x_end, y_end) =
+                    render_state.regions_to_compute[render_state.current_region_idx];
 
                 let start_row = render_state.current_region_row;
                 let end_row = (start_row + rows_per_frame).min(y_end);
@@ -484,12 +628,15 @@ fn main() {
                         let mut row_pixels = Vec::new();
                         for x in x_start..x_end {
                             let re = re_min + (x as f64 / compute_width as f64) * (re_max - re_min);
-                            let im = im_max - (y as f64 / compute_height as f64) * (im_max - im_min);
+                            let im =
+                                im_max - (y as f64 / compute_height as f64) * (im_max - im_min);
 
                             let s = Complex::with_val(precision, (re, im));
                             let zeta = riemann_zeta(&s);
 
-                            let magnitude = (zeta.real().to_f64().powi(2) + zeta.imag().to_f64().powi(2)).sqrt();
+                            let magnitude = (zeta.real().to_f64().powi(2)
+                                + zeta.imag().to_f64().powi(2))
+                            .sqrt();
                             let color = magnitude_to_color(magnitude, log_scale);
 
                             row_pixels.push((x, y, color));
@@ -508,7 +655,9 @@ fn main() {
                 // Move to next region if current region is complete
                 if render_state.current_region_row >= y_end {
                     render_state.current_region_idx += 1;
-                    render_state.current_region_row = if render_state.current_region_idx < render_state.regions_to_compute.len() {
+                    render_state.current_region_row = if render_state.current_region_idx
+                        < render_state.regions_to_compute.len()
+                    {
                         render_state.regions_to_compute[render_state.current_region_idx].1
                     } else {
                         0
@@ -518,7 +667,16 @@ fn main() {
                 // Check if all regions are complete
                 if render_state.current_region_idx >= render_state.regions_to_compute.len() {
                     render_state.is_complete = true;
-                    println!("Rendering complete!");
+                    println!("[RENDER COMPLETE] All regions finished, buffer is now stable");
+
+                    // If we accumulated pans during rendering, process them now
+                    if pending_recompute {
+                        println!(
+                            "[RENDER COMPLETE] Pending pan detected, triggering incremental update"
+                        );
+                        needs_recompute = true;
+                        pending_recompute = false;
+                    }
                 }
             }
         }
@@ -536,22 +694,30 @@ fn main() {
                 let y1 = (y * window_height) / view.compute_height;
                 let y2 = ((y + 1) * window_height) / view.compute_height;
 
-                let rect = Rect::new(
-                    x1 as i32,
-                    y1 as i32,
-                    x2 - x1,
-                    y2 - y1,
-                );
+                let rect = Rect::new(x1 as i32, y1 as i32, x2 - x1, y2 - y1);
                 canvas.fill_rect(rect).unwrap();
             }
         }
 
         if view.show_axes {
             draw_axes(&mut canvas, &view, &font, window_width, window_height);
-            draw_mouse_coordinates(&mut canvas, &view, &font, current_mouse_pos, window_width, window_height);
+            draw_mouse_coordinates(
+                &mut canvas,
+                &view,
+                &font,
+                current_mouse_pos,
+                window_width,
+                window_height,
+            );
         }
 
-        draw_info_overlay(&mut canvas, &view, &render_state, window_width, window_height);
+        draw_info_overlay(
+            &mut canvas,
+            &view,
+            &render_state,
+            window_width,
+            window_height,
+        );
 
         canvas.present();
         std::thread::sleep(Duration::from_millis(16));
@@ -613,7 +779,12 @@ fn draw_axes(
             if let Ok(texture) = texture_creator.create_texture_from_surface(&surface) {
                 let x_pos = (t * width as f64) as i32;
                 let query = texture.query();
-                let target = Rect::new(x_pos - query.width as i32 / 2, height as i32 - 20, query.width, query.height);
+                let target = Rect::new(
+                    x_pos - query.width as i32 / 2,
+                    height as i32 - 20,
+                    query.width,
+                    query.height,
+                );
 
                 let bg_rect = Rect::new(
                     target.x() - 2,
@@ -632,7 +803,12 @@ fn draw_axes(
             if let Ok(texture) = texture_creator.create_texture_from_surface(&surface) {
                 let y_pos = (t * height as f64) as i32;
                 let query = texture.query();
-                let target = Rect::new(5, y_pos - query.height as i32 / 2, query.width, query.height);
+                let target = Rect::new(
+                    5,
+                    y_pos - query.height as i32 / 2,
+                    query.width,
+                    query.height,
+                );
 
                 let bg_rect = Rect::new(
                     target.x() - 2,
@@ -816,7 +992,9 @@ fn dirichlet_eta(s: &Complex) -> Complex {
     let precision = s.prec().0;
     let mut sum = Complex::with_val(precision, (0.0, 0.0));
 
-    let max_terms = ((precision as f64 / 2.0).ceil() as usize).max(100).min(50000);
+    let max_terms = ((precision as f64 / 2.0).ceil() as usize)
+        .max(100)
+        .min(50000);
 
     for n in 1..=max_terms {
         let n_complex = Complex::with_val(precision, (n as f64, 0.0));
