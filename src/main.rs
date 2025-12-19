@@ -137,14 +137,6 @@ impl RenderState {
         }
     }
 
-    fn reset(&mut self) {
-        self.current_row = 0;
-        self.is_complete = false;
-        for pixel in &mut self.buffer {
-            *pixel = Color::RGB(0, 0, 0);
-        }
-    }
-
     fn start_full_recompute(&mut self, view: &ViewState, width: u32, height: u32) {
         self.current_row = 0;
         self.is_complete = false;
