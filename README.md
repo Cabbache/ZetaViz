@@ -1,4 +1,6 @@
 # Zeta visualizer
+![](https://cabbache.github.io/zetaviz.gif)
+
 Has a cache for panning more efficiently.  
 Make sure to use a high enough precision (> 800) to see the zeroes correctly.
 
@@ -16,5 +18,3 @@ Controls:
   Space : Force re-render
   ESC : Exit
 ```
-
-![](https://cabbache.github.io/zetaviz.gif)
