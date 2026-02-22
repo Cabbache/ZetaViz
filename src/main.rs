@@ -335,7 +335,10 @@ fn main() {
     println!("  A : Toggle axes");
     println!("  L : Toggle logarithmic color scale");
     println!("  F : Toggle filter (hide Re >= 1)");
-    println!("  R : Reset view");
+    println!(
+        "  Z/X : Zoom in/out
+  R : Reset view"
+    );
     println!("  Space : Force re-render");
     println!("  ESC : Exit\n");
 
@@ -425,7 +428,11 @@ fn main() {
                     }
                 }
 
-                Event::MouseWheel { y: wheel_y, .. } => {
+                Event::MouseWheel {
+                    y: wheel_y,
+                    direction,
+                    ..
+                } => {
                     let (center_re, center_im) = view.pixel_to_complex(
                         current_mouse_pos.0,
                         current_mouse_pos.1,
@@ -433,7 +440,11 @@ fn main() {
                         window_height,
                     );
 
-                    let zoom_factor = if wheel_y > 0 { 0.8 } else { 1.25 };
+                    let effective_y = match direction {
+                        sdl2::mouse::MouseWheelDirection::Flipped => -wheel_y,
+                        _ => wheel_y,
+                    };
+                    let zoom_factor = if effective_y > 0 { 0.8 } else { 1.25 };
                     view.zoom(
                         zoom_factor,
                         center_re,
@@ -486,6 +497,18 @@ fn main() {
                             "Logarithmic scale: {}",
                             if view.log_scale { "ON" } else { "OFF" }
                         );
+                        needs_recompute = true;
+                    }
+                    Keycode::Z => {
+                        let center_re = (view.re_min + view.re_max) / 2.0;
+                        let center_im = (view.im_min + view.im_max) / 2.0;
+                        view.zoom(0.8, center_re, center_im, window_width, window_height);
+                        needs_recompute = true;
+                    }
+                    Keycode::X => {
+                        let center_re = (view.re_min + view.re_max) / 2.0;
+                        let center_im = (view.im_min + view.im_max) / 2.0;
+                        view.zoom(1.25, center_re, center_im, window_width, window_height);
                         needs_recompute = true;
                     }
                     Keycode::R => {
