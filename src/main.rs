@@ -355,17 +355,14 @@ fn main() {
     let mut canvas = window.into_canvas().build().unwrap();
     let mut event_pump = sdl_context.event_pump().unwrap();
 
-    let font_paths = [
-        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ];
+    let font_path = fontconfig::Fontconfig::new()
+        .and_then(|fc| fc.find("sans-serif", None))
+        .map(|f| f.path)
+        .expect("Could not find any font via fontconfig.");
 
-    let font = font_paths
-        .iter()
-        .find_map(|path| ttf_context.load_font(path, 14).ok())
-        .expect("Could not load any font. Please install a basic TrueType font.");
+    let font = ttf_context
+        .load_font(&font_path, 14)
+        .expect("Could not load font.");
 
     let mut view = ViewState::new();
     let mut render_state = RenderState::new(&view, view.compute_width, view.compute_height);
